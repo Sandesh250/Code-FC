@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDEs
+.vscode/
+.idea/
+.agents/
+
+# Node/React frontend build
+frontend/node_modules/
+frontend/dist/
+frontend/.eslintcache
+
+# GameCast Pipeline Uploads & Processed outputs
+uploads/*
+!uploads/.gitkeep
+processed/*
+!processed/.gitkeep
+clips/*
+out/*
+.face_cache/
+
+# Large model files / weights / checkpoints
+*.pt
+*.pkl
+*.json
+
+# Datasets (Prevent pushing local download folders to Git)
+datasets/
+face images/
+stat/
