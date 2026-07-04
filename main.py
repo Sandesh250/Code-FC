@@ -8,7 +8,10 @@ from ultralytics import YOLO
 from shot_segmentation import find_shots
 from relevance_check import check_shot_relevance
 from detection import track_shot
-from tracking_utils import interpolate_ball_positions, filter_ball_trajectory_kalman, calculate_ball_speeds, get_perspective_transformer
+from tracking_utils import (interpolate_ball_positions, filter_ball_trajectory_kalman,
+                            calculate_ball_speeds, get_perspective_transformer,
+                            map_point_homography, CameraMovementEstimator,
+                            estimate_player_performance)
 from overlay import (draw_player_overlay, draw_ball_overlay, detect_impacts,
                      draw_tactical_radar, draw_advanced_player_overlay,
                      draw_speed_badge, draw_shot_beam,
@@ -141,6 +144,11 @@ def run_pipeline(
     face_recognizer_a = FaceRecognizer(team_filter=team_a_name, active_match=active_match_tuple)
     face_recognizer_b = FaceRecognizer(team_filter=team_b_name, active_match=active_match_tuple)
 
+    # ---- Telemetry Data Storage ----
+    timeline_telemetry = [None] * total_frames
+    player_distances = {}
+    player_last_radar = {}
+
     out_dir = os.path.dirname(output_path) or "."
     if not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
@@ -214,6 +222,9 @@ def run_pipeline(
             ball_speeds = calculate_ball_speeds(ball_positions, fps=fps)
             H = get_perspective_transformer(width, height, radar_w=200, radar_h=130)
             
+            # Initialize camera motion estimator for this shot
+            camera_estimator = CameraMovementEstimator()
+
             if progress_callback:
                 progress_callback(percent, f"Shot {idx+1}/{len(shots)}: drawing visual effects...")
                 
@@ -225,6 +236,11 @@ def run_pipeline(
                     
                 frame_data = raw_tracking_data[f_offset]
                 ball_pos = ball_positions[f_offset]
+                f_idx = start + f_offset
+
+                # Estimate camera motion translation vector
+                cam_dx, cam_dy = camera_estimator.estimate(frame)
+                cam_mag = float(np.sqrt(cam_dx*cam_dx + cam_dy*cam_dy))
                 
                 # Determine player in possession
                 possession_track_id = -1
@@ -311,6 +327,53 @@ def run_pipeline(
                     team_b_name=team_b_name,
                 )
                 
+                # ---- Collect player metrics telemetry for this frame ----
+                from overlay import _track_to_name_map, get_possession_pct
+                pct_a, pct_b = get_possession_pct()
+                
+                frame_players_telemetry = []
+                for player in frame_data["players"]:
+                    track_id = player["track_id"]
+                    team_id = player.get("team_id", 0)
+                    bbox = player["bbox"]
+                    
+                    px = (bbox[0] + bbox[2]) / 2.0
+                    py = bbox[3]  # Contact point (bottom center of player box)
+                    
+                    try:
+                        rx, ry = map_point_homography(H, px, py)
+                    except Exception:
+                        rx, ry = 100, 65 # center fallback
+                        
+                    # Calculate running speed and accumulate distance
+                    speed_kmh, dist_m = estimate_player_performance(
+                        player_last_radar.get(track_id), (rx, ry), fps
+                    )
+                    player_distances[track_id] = player_distances.get(track_id, 0.0) + dist_m
+                    player_last_radar[track_id] = (rx, ry)
+                    
+                    # Roster name lookup
+                    name = _track_to_name_map.get(track_id, f"#{track_id}")
+                    
+                    frame_players_telemetry.append({
+                        "name": name,
+                        "track_id": track_id,
+                        "team_id": team_id,
+                        "speed_kmh": round(speed_kmh, 1),
+                        "distance_m": round(player_distances[track_id], 1),
+                        "radar_coords": [rx, ry]
+                    })
+                    
+                # Save telemetry for this frame
+                timeline_telemetry[f_idx] = {
+                    "frame_idx": f_idx,
+                    "ball_speed": round(ball_speeds[f_offset], 1),
+                    "possession_pct_a": pct_a,
+                    "possession_pct_b": pct_b,
+                    "camera_motion": round(cam_mag, 1),
+                    "players": frame_players_telemetry
+                }
+                
                 writer.write(frame)
                 
         else:
@@ -318,10 +381,20 @@ def run_pipeline(
             print(f"[Main] Shot {idx+1} is classified as PASS-THROUGH. Copying original frames...")
             
             cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            for _ in range(start, end):
+            for f_idx in range(start, end):
                 ret, frame = cap.read()
                 if not ret:
                     break
+                    
+                # Store default blank stats for pass-through frames
+                timeline_telemetry[f_idx] = {
+                    "frame_idx": f_idx,
+                    "ball_speed": 0.0,
+                    "possession_pct_a": 50.0,
+                    "possession_pct_b": 50.0,
+                    "camera_motion": 0.0,
+                    "players": []
+                }
                 writer.write(frame)
                 
     cap.release()
@@ -335,6 +408,24 @@ def run_pipeline(
         progress_callback(85, "Stitching shots and restoring sound via FFmpeg...")
         
     finalize_video_with_audio(temp_silent_path, input_path, output_path)
+
+    # Export analytical telemetry for interactive dashboard
+    import json
+    json_path = output_path + ".json"
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "fps": fps,
+                "total_frames": total_frames,
+                "team_a_name": team_a_name,
+                "team_b_name": team_b_name,
+                "team_a_color": team_a_color,
+                "team_b_color": team_b_color,
+                "timeline": timeline_telemetry
+            }, f, indent=2)
+        print(f"[Main] Telemetry JSON exported successfully -> {json_path}")
+    except Exception as e:
+        print(f"[Main] Warning: Could not export telemetry JSON: {e}")
     
     if progress_callback:
         progress_callback(100, "Processing complete!")

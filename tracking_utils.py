@@ -172,3 +172,92 @@ def map_point_homography(H: np.ndarray, px: float, py: float) -> tuple[int, int]
     ry = int(mapped[0][0][1])
     return rx, ry
 
+
+class CameraMovementEstimator:
+    """
+    Estimates broadcast camera motion between successive frames using Lucas-Kanade optical flow.
+    Tracks sparse background keypoints (excluding players/referee/ball area where possible).
+    """
+    def __init__(self):
+        self.prev_gray = None
+        self.prev_pts = None
+        # Lucas-Kanade params
+        self.lk_params = dict(
+            winSize=(15, 15),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+        )
+        self.min_features = 30
+
+    def estimate(self, frame: np.ndarray) -> tuple[float, float]:
+        """
+        Estimates the (dx, dy) translation of the camera from the last frame.
+        Returns: (dx, dy) in pixels
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        dx, dy = 0.0, 0.0
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            self.prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=100, qualityLevel=0.3, minDistance=7)
+            return 0.0, 0.0
+
+        if self.prev_pts is not None and len(self.prev_pts) > 0:
+            next_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray, gray, self.prev_pts, None, **self.lk_params
+            )
+
+            if next_pts is not None:
+                good_prev = self.prev_pts[status == 1]
+                good_next = next_pts[status == 1]
+
+                if len(good_prev) > 0:
+                    diff = good_next - good_prev
+                    dx = float(np.mean(diff[:, 0]))
+                    dy = float(np.mean(diff[:, 1]))
+
+                self.prev_pts = good_next.reshape(-1, 1, 2)
+
+        # Re-initialize keypoints if feature count drops below threshold
+        if self.prev_pts is None or len(self.prev_pts) < self.min_features:
+            self.prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=100, qualityLevel=0.3, minDistance=7)
+
+        self.prev_gray = gray
+        return dx, dy
+
+
+def estimate_player_performance(
+    radar_pos_prev: tuple[int, int] | None,
+    radar_pos_curr: tuple[int, int],
+    fps: float,
+) -> tuple[float, float]:
+    """
+    Computes player running speed (km/h) and distance traveled (meters) between frames.
+    Conversion constants (mapping 200x130 radar pixels to 105m x 68m pitch):
+      - 1 horizontal pixel = 105 / 200 = 0.525 meters
+      - 1 vertical pixel = 68 / 130 = 0.523 meters
+    """
+    if radar_pos_prev is None:
+        return 0.0, 0.0
+
+    rx_prev, ry_prev = radar_pos_prev
+    rx_curr, ry_curr = radar_pos_curr
+
+    dx_m = (rx_curr - rx_prev) * 0.525
+    dy_m = (ry_curr - ry_prev) * 0.523
+    dist_m = np.sqrt(dx_m * dx_m + dy_m * dy_m)
+
+    # Filter out sub-pixel coordinates tracker noise
+    if dist_m < 0.06:
+        return 0.0, 0.0
+
+    # speed (m/s) = distance (m) * fps (1/s)
+    speed_ms = dist_m * fps
+    speed_kmh = speed_ms * 3.6
+
+    # Clamp human running speed limit (max sprint ~38 km/h)
+    if speed_kmh > 38.0:
+        speed_kmh = 38.0
+
+    return speed_kmh, dist_m
+
